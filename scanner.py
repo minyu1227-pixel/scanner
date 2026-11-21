@@ -10,23 +10,32 @@ MACD(5, 20, 5) 골든크로스 + 이격도(15 SMA) 과매도 이력 스캐너
 시그널    : ① 최근 봉에서 MACD 골든크로스
             ② 최근 봉을 제외한 직전 10개 봉 중 이격도 <= 85 인 봉 존재
 
-필요 패키지 : pip install yfinance pandas numpy requests
-사용 예     : python scanner.py
-              python scanner.py --limit 300          (테스트용: 앞 300종목만)
-              python scanner.py --include-today      (장중 미완성 봉 포함)
+텔레그램  : 환경변수 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID 가 있으면 실행 결과를 전송
+            (결과와 상관없이 실행 1회당 최소 1개 메시지, 오류 발생 시 오류 메시지)
+
+필요 패키지 : pip install yfinance pandas numpy
+사용 예     : python scanner.py                       (전체 스캔 → 오늘 시그널 전송)
+              python scanner.py --codes TSLA AAPL     (지정 종목의 과거 시그널 일자 전송)
+              python scanner.py --codes TSLA,NVDA --max-signals 20
+              python scanner.py --limit 300            (테스트용: 앞 300종목만)
+              python scanner.py --include-today        (장중 미완성 봉 포함)
 """
 
 from __future__ import annotations
 
 import argparse
 import io
+import json
+import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 
 # ───── 전제 조건 (Pine Script 입력값과 동일) ─────
@@ -44,8 +53,11 @@ TURNOVER_DAYS = 20                   # 거래대금 평균 기간
 FALLBACK_USDKRW = 1400.0             # 환율 조회 실패 시 사용할 값
 
 # ───── 종목 리스트 (NASDAQ Trader 공식 심볼 디렉터리) ─────
-NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-OTHER_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+#   HTTPS가 봇 차단(Incapsula 503)되는 경우가 있어 같은 파일의 공식 FTP로 자동 대체
+SYMDIR_SOURCES = [
+    "https://www.nasdaqtrader.com/dynamic/SymDir/{}",
+    "ftp://ftp.nasdaqtrader.com/symboldirectory/{}",
+]
 OTHER_EXCHANGES = {"N": "NYSE", "A": "AMEX"}   # A = NYSE American(구 AMEX)
 
 # 보통주가 아닌 증권을 걸러내기 위한 키워드
@@ -55,14 +67,92 @@ EXCLUDE_RE = re.compile(
     re.IGNORECASE,
 )
 
+TELEGRAM_MAX_LEN = 4000   # 텔레그램 메시지 한도(4096자)보다 약간 작게
+
+
+# ════════════════════════════════════════════════════════════
+# 0. 텔레그램 (표준 라이브러리 urllib만 사용)
+# ════════════════════════════════════════════════════════════
+def _split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
+    """줄 단위로 끊어서 텔레그램 길이 제한 안으로 분할."""
+    chunks, cur = [], ""
+    for line in text.splitlines():
+        while len(line) > limit:              # 한 줄이 너무 긴 경우
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    return chunks or [text[:limit]]
+
+
+def send_telegram(text: str) -> bool:
+    token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("[텔레그램] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 환경변수가 없어 전송을 건너뜁니다.")
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    ok = True
+    for chunk in _split_message(text):
+        data = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": chunk,
+            "disable_web_page_preview": "true",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    body = json.loads(r.read().decode("utf-8"))
+                if not body.get("ok"):
+                    print(f"[텔레그램] 전송 실패: {body.get('description')}")
+                    ok = False
+                break
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")
+                print(f"[텔레그램] HTTP {e.code}: {detail}")
+                if e.code == 429 and attempt < 2:      # 요청 과다 → 잠시 후 재시도
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                ok = False
+                break
+            except Exception as e:                      # 네트워크 오류 등
+                print(f"[텔레그램] 전송 오류(재시도 {attempt + 1}/3): {type(e).__name__}")
+                if attempt == 2:
+                    ok = False
+                time.sleep(3 * (attempt + 1))
+    if ok:
+        print("[텔레그램] 전송 완료")
+    return ok
+
 
 # ════════════════════════════════════════════════════════════
 # 1. 종목 유니버스
 # ════════════════════════════════════════════════════════════
-def _read_symdir(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text), sep="|", dtype=str)
+def _fetch_symdir_text(filename: str) -> str:
+    errors = []
+    for tmpl in SYMDIR_SOURCES:
+        url = tmpl.format(filename)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                text = r.read().decode("utf-8", errors="replace")
+            if "|" in text.splitlines()[0]:          # 정상적인 파이프 구분 파일인지 확인
+                return text
+            errors.append(f"{url}: 예상치 못한 응답")
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+        print(f"  [경고] 종목 리스트 다운로드 실패 → 다음 경로 시도 ({errors[-1]})")
+    raise RuntimeError(f"{filename} 다운로드 실패: " + " / ".join(errors))
+
+
+def _read_symdir(filename: str) -> pd.DataFrame:
+    df = pd.read_csv(io.StringIO(_fetch_symdir_text(filename)), sep="|", dtype=str)
     # 마지막 줄 "File Creation Time: ..." 제거
     return df[~df.iloc[:, 0].str.startswith("File Creation Time", na=False)]
 
@@ -72,11 +162,11 @@ def _is_common_stock(name: str) -> bool:
 
 
 def get_universe() -> pd.DataFrame:
-    nq = _read_symdir(NASDAQ_URL)
+    nq = _read_symdir("nasdaqlisted.txt")
     nq = nq[(nq["Test Issue"] == "N") & (nq["ETF"] == "N")]
     nq = nq.assign(Exchange="NASDAQ")[["Symbol", "Security Name", "Exchange"]]
 
-    ot = _read_symdir(OTHER_URL)
+    ot = _read_symdir("otherlisted.txt")
     ot = ot[(ot["Test Issue"] == "N") & (ot["ETF"] == "N")
             & ot["Exchange"].isin(OTHER_EXCHANGES.keys())]
     ot = ot.rename(columns={"ACT Symbol": "Symbol"})
@@ -86,10 +176,19 @@ def get_universe() -> pd.DataFrame:
     df = pd.concat([nq, ot], ignore_index=True)
     df = df[df["Security Name"].fillna("").map(_is_common_stock)]
 
-    # yfinance 표기로 변환 (BRK.B → BRK-B)
-    df["Ticker"] = df["Symbol"].str.strip().str.replace(r"[./]", "-", regex=True)
+    df["Ticker"] = df["Symbol"].map(to_yf_ticker)
     df = df[~df["Ticker"].str.contains(r"[\$=\^\s]", regex=True)]
     return df.drop_duplicates("Ticker").reset_index(drop=True)
+
+
+def to_yf_ticker(symbol: str) -> str:
+    """yfinance 표기로 변환 (BRK.B → BRK-B)."""
+    return re.sub(r"[./]", "-", symbol.strip().upper())
+
+
+def short_name(name: str) -> str:
+    """'Tesla, Inc. - Common Stock' → 'Tesla, Inc.'"""
+    return re.sub(r"\s*-?\s*(Class [A-Z] )?Common Stock.*$", "", str(name), flags=re.I).strip() or str(name)
 
 
 # ════════════════════════════════════════════════════════════
@@ -112,25 +211,31 @@ def pine_ema(s: pd.Series, length: int) -> pd.Series:
     return pd.Series(out, index=s.index)
 
 
-def evaluate(df: pd.DataFrame, min_turnover_usd: float) -> dict | None:
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["Close", "Volume"])
-    df = df[df["Volume"] > 0]
+    return df[df["Volume"] > 0]
+
+
+def compute_indicators(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    macd = pine_ema(close, MACD_FAST) - pine_ema(close, MACD_SLOW)   # MACD(5, 20)
+    signal = pine_ema(macd, MACD_SIGNAL)                              # Signal(5)
+    disparity = close / close.rolling(DISP_LEN).mean() * 100          # 이격도(15 SMA)
+    return macd, signal, disparity
+
+
+def evaluate(df: pd.DataFrame, min_turnover_usd: float) -> dict | None:
+    """가장 최근 봉 기준으로 조건 판정 (전체 스캔용)."""
+    df = _clean(df)
     need = max(MACD_SLOW + MACD_SIGNAL + 2, DISP_LEN + LOOKBACK + 1, TURNOVER_DAYS)
     if len(df) < need:
         return None
 
     close = df["Close"].astype(float)
     volume = df["Volume"].astype(float)
-
     last_close = close.iloc[-1]
     avg_turnover = (close * volume).iloc[-TURNOVER_DAYS:].mean()
 
-    # MACD(5, 20, 5)
-    macd = pine_ema(close, MACD_FAST) - pine_ema(close, MACD_SLOW)
-    signal = pine_ema(macd, MACD_SIGNAL)
-
-    # 이격도 = 종가 / SMA(15) × 100
-    disparity = close / close.rolling(DISP_LEN).mean() * 100
+    macd, signal, disparity = compute_indicators(close)
 
     # ① ta.crossover(macd, signal): 오늘 macd > signal, 어제 macd <= signal
     golden_cross = bool(macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2])
@@ -152,6 +257,28 @@ def evaluate(df: pd.DataFrame, min_turnover_usd: float) -> dict | None:
         "GoldenCross": golden_cross,
         "WasOversold": was_oversold,
     }
+
+
+def find_signal_dates(df: pd.DataFrame, min_turnover_usd: float) -> pd.DataFrame:
+    """전체 기간에서 시그널이 발생한 모든 봉 (종목 지정 조회용)."""
+    df = _clean(df)
+    close = df["Close"].astype(float)
+    volume = df["Volume"].astype(float)
+    macd, signal, disparity = compute_indicators(close)
+
+    golden_cross = (macd > signal) & (macd.shift(1) <= signal.shift(1))
+    min_disp = disparity.rolling(LOOKBACK).min().shift(1)
+    hit = golden_cross & (min_disp <= DISP_TH)
+
+    turnover = (close * volume).rolling(TURNOVER_DAYS).mean()
+    out = pd.DataFrame({
+        "Close": close.round(2),
+        "Disparity": disparity.round(2),
+        "MinDisp10": min_disp.round(2),
+        "AvgTurnoverUSD": turnover,
+    })[hit]
+    out["PassFilter"] = (out["Close"] >= MIN_PRICE_USD) & (out["AvgTurnoverUSD"] >= min_turnover_usd)
+    return out
 
 
 # ════════════════════════════════════════════════════════════
@@ -197,7 +324,9 @@ def download_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
         level0 = set(data.columns.get_level_values(0))
         for t in tickers:
             if t in level0:
-                result[t] = data[t]
+                sub = data[t].dropna(how="all")
+                if not sub.empty:
+                    result[t] = sub
     elif len(tickers) == 1:
         result[tickers[0]] = data
     return result
@@ -214,17 +343,53 @@ def drop_incomplete_bar(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ════════════════════════════════════════════════════════════
-# 4. 메인
+# 4. 실행 모드
 # ════════════════════════════════════════════════════════════
-def main() -> None:
-    ap = argparse.ArgumentParser(description="MACD 골든크로스 + 이격도 과매도 스캐너")
-    ap.add_argument("--limit", type=int, default=0, help="앞에서부터 N종목만 스캔 (테스트용)")
-    ap.add_argument("--batch-size", type=int, default=100, help="yfinance 한 번에 받을 종목 수")
-    ap.add_argument("--period", default="1y", help="다운로드 기간 (EMA 안정화를 위해 1y 권장)")
-    ap.add_argument("--include-today", action="store_true", help="장중 미완성 봉도 포함")
-    ap.add_argument("--out", default="", help="결과 CSV 경로 (기본: scan_YYYYMMDD.csv)")
-    args = ap.parse_args()
+def run_codes(args, codes: list[str]) -> tuple[str, bool]:
+    """지정 종목의 과거 시그널 일자 목록."""
+    period = args.period or "max"
+    usdkrw = get_usdkrw()
+    min_turnover_usd = MIN_TURNOVER_KRW / usdkrw
 
+    print(f"▶ 종목 조회: {', '.join(codes)} (기간 {period})")
+    frames = download_batch(codes, period)
+
+    lines = [f"🔍 MACD GC + 이격도 과매도 시그널 조회",
+             f"종목: {', '.join(codes)} | 기간: {period}", ""]
+    any_data = False
+    for t in codes:
+        df = frames.get(t)
+        if df is None or df.empty:
+            lines += [f"[{t}] 데이터 없음 (티커 확인 필요)", ""]
+            print(f"  {t}: 데이터 없음")
+            continue
+        any_data = True
+        if not args.include_today:
+            df = drop_incomplete_bar(df)
+        sig = find_signal_dates(df, min_turnover_usd)
+        start, end = df.index[0].date(), df.index[-1].date()
+        if sig.empty:
+            lines += [f"[{t}] 시그널 없음 ({start} ~ {end})", ""]
+            print(f"  {t}: 시그널 없음")
+            continue
+
+        shown = sig.tail(args.max_signals).iloc[::-1] if args.max_signals > 0 else sig.iloc[::-1]
+        lines.append(f"[{t}] 시그널 {len(sig)}회 ({start} ~ {end})"
+                     + (f", 최근 {len(shown)}개" if len(shown) < len(sig) else ""))
+        for d, r in shown.iterrows():
+            mark = "" if r["PassFilter"] else "  (1·2차 조건 미충족)"
+            lines.append(f"• {d.date()}  ${r['Close']:,.2f}{mark}")
+        lines.append("")
+
+        print(f"\n[{t}] 시그널 {len(sig)}회")
+        print(shown.drop(columns="AvgTurnoverUSD").to_string())
+
+    return "\n".join(lines).strip(), any_data
+
+
+def run_scan(args) -> tuple[str, bool]:
+    """전체 종목 스캔 → 오늘 시그널."""
+    period = args.period or "1y"
     print("▶ 종목 리스트 수집 중...")
     universe = get_universe()
     if args.limit:
@@ -243,7 +408,7 @@ def main() -> None:
     for b in range(n_batches):
         batch = tickers[b * args.batch_size:(b + 1) * args.batch_size]
         print(f"▶ 다운로드 {b + 1}/{n_batches} ({len(batch)}종목)", end="\r", flush=True)
-        frames = download_batch(batch, args.period)
+        frames = download_batch(batch, period)
         for t, df in frames.items():
             if not args.include_today:
                 df = drop_incomplete_bar(df)
@@ -260,10 +425,12 @@ def main() -> None:
     print()
 
     if not rows:
-        print("데이터를 받지 못했습니다.")
-        sys.exit(1)
+        return (f"⚠️ 스캔 실패: 시세 데이터를 받지 못했습니다. (대상 {len(tickers):,}종목)", False)
 
     res = pd.DataFrame(rows)
+    # 거래정지·상폐 등으로 최신 봉이 없는 종목 제외 → 가장 최근 거래일 기준
+    scan_date = res["Date"].max()
+    res = res[res["Date"] == scan_date]
     res["AvgTurnoverKRW_억"] = (res["AvgTurnoverUSD"] * usdkrw / 1e8).round(0)
     res["AvgTurnoverUSD"] = res["AvgTurnoverUSD"].round(0)
 
@@ -271,7 +438,7 @@ def main() -> None:
     hits = passed[passed["GoldenCross"] & passed["WasOversold"]]
     hits = hits.sort_values("AvgTurnoverUSD", ascending=False)
 
-    print(f"  데이터 수신 {len(res):,}개 → 1·2차 조건 통과 {len(passed):,}개 → 시그널 {len(hits):,}개")
+    print(f"  기준일 {scan_date} | 데이터 {len(res):,}개 → 1·2차 통과 {len(passed):,}개 → 시그널 {len(hits):,}개")
 
     cols = ["Ticker", "Exchange", "Date", "Close", "Disparity", "MinDisp10",
             "MACD", "Signal", "AvgTurnoverKRW_억", "Name"]
@@ -285,6 +452,51 @@ def main() -> None:
     out = args.out or f"scan_{pd.Timestamp.now():%Y%m%d}.csv"
     hits[cols].to_csv(out, index=False, encoding="utf-8-sig")
     print(f"\n결과 저장: {out}")
+
+    header = [f"📈 MACD GC + 이격도 과매도 스캔 ({scan_date})",
+              f"대상 {len(res):,}종목 → 1·2차 통과 {len(passed):,} → 시그널 {len(hits):,}", ""]
+    if hits.empty:
+        body = ["📭 오늘은 시그널 없음"]
+    else:
+        body = [f"{i}. {r.Ticker} ({short_name(r.Name)}) | {r.Date} | ${r.Close:,.2f}"
+                for i, r in enumerate(hits.itertuples(index=False), 1)]
+    return "\n".join(header + body), True
+
+
+# ════════════════════════════════════════════════════════════
+# 5. 메인
+# ════════════════════════════════════════════════════════════
+def parse_codes(raw: list[str] | None) -> list[str]:
+    if not raw:
+        return []
+    codes = [to_yf_ticker(c) for item in raw for c in item.split(",") if c.strip()]
+    return list(dict.fromkeys(codes))   # 순서 유지 중복 제거
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="MACD 골든크로스 + 이격도 과매도 스캐너")
+    ap.add_argument("--codes", nargs="+", help="조회할 종목 (예: --codes TSLA AAPL 또는 TSLA,AAPL)")
+    ap.add_argument("--max-signals", type=int, default=10,
+                    help="--codes 조회 시 종목별로 보여줄 최근 시그널 수 (0 = 전부, 기본 10)")
+    ap.add_argument("--limit", type=int, default=0, help="앞에서부터 N종목만 스캔 (테스트용)")
+    ap.add_argument("--batch-size", type=int, default=100, help="yfinance 한 번에 받을 종목 수")
+    ap.add_argument("--period", default=None,
+                    help="다운로드 기간 (기본: 전체 스캔 1y, --codes 조회 max)")
+    ap.add_argument("--include-today", action="store_true", help="장중 미완성 봉도 포함")
+    ap.add_argument("--out", default="", help="결과 CSV 경로 (기본: scan_YYYYMMDD.csv)")
+    args = ap.parse_args()
+
+    codes = parse_codes(args.codes)
+    try:
+        message, ok = run_codes(args, codes) if codes else run_scan(args)
+    except Exception as e:
+        mode = f"종목 조회({', '.join(codes)})" if codes else "전체 스캔"
+        send_telegram(f"❌ 스캐너 실행 오류 - {mode}\n{type(e).__name__}: {e}")
+        raise
+
+    send_telegram(message)
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
