@@ -48,6 +48,11 @@ ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 SSM_KEY = "/scanner/positions"
 
+# 토스증권 OpenAPI (toss_api_docs.md 규격) — 키는 서버 환경변수 파일(.env)에서 읽음
+TOSS_CLIENT_ID = os.environ.get("TOSS_CLIENT_ID", "").strip()
+TOSS_CLIENT_SECRET = os.environ.get("TOSS_CLIENT_SECRET", "").strip()
+TOSS_BASE = "https://openapi.tossinvest.com"
+
 # 메시지 본문(시그널 정보)과 상태 문구를 구분하는 줄.
 # 상태가 바뀌어도 위쪽 시그널 정보는 그대로 두고, 취소 시 원래 메시지로 복원하는 데 사용합니다.
 SEP = "\n\n━━━━━━━━━━\n"
@@ -145,6 +150,115 @@ def save_positions(positions: dict) -> None:
     )
 
 
+def committed_budget(positions: dict, exclude: str | None = None) -> float:
+    """이미 승인됐지만 아직 주문 전(APPROVED)인 금액 합계 — 예수금에서 빼고 봐야 하는 금액."""
+    return sum(float(p.get("budget") or 0) for s, p in positions.items()
+               if p.get("status") == "APPROVED" and s != exclude)
+
+
+# ════════════════════════════════════════════════════════════
+# 토스증권 OpenAPI (toss_api_docs.md 규격만 사용)
+# ════════════════════════════════════════════════════════════
+class TossError(Exception):
+    def __init__(self, status: int, code: str = "", message: str = ""):
+        self.status, self.code = status, code
+        super().__init__(f"HTTP {status} {code} {message}".strip())
+
+
+def toss_request(method: str, path: str, token: str | None = None, account_seq=None,
+                 form: dict | None = None) -> dict:
+    """한 번 호출. 429(요청 한도 초과)면 잠시 쉬었다가 한 번 더 시도."""
+    for attempt in range(2):
+        try:
+            return _toss_request_once(method, path, token, account_seq, form)
+        except TossError as e:
+            if e.status == 429 and attempt == 0:
+                time.sleep(2)
+                continue
+            raise
+
+
+def _toss_request_once(method: str, path: str, token: str | None, account_seq, form: dict | None) -> dict:
+    headers = {}
+    data = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if account_seq is not None:
+        headers["X-Tossinvest-Account"] = str(account_seq)
+    if form is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        data = urllib.parse.urlencode(form).encode()
+    req = urllib.request.Request(TOSS_BASE + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = r.read().decode("utf-8")
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            err = json.loads(raw).get("error", {})
+        except Exception:
+            err = {"message": raw[:200]}
+        raise TossError(e.code, err.get("code", ""), err.get("message", "")) from None
+
+
+# 토큰·계좌번호 재사용 (요청 한도 429 방지). 토큰은 10분 지나거나 401이 나면 새로 발급.
+TOKEN_TTL_SEC = 600
+_toss_cache: dict = {"token": None, "token_at": 0.0, "account_seq": None}
+
+
+def toss_token(force: bool = False) -> str:
+    if not TOSS_CLIENT_ID or not TOSS_CLIENT_SECRET:
+        raise RuntimeError("TOSS_CLIENT_ID / TOSS_CLIENT_SECRET 환경변수가 없습니다")
+    if not force and _toss_cache["token"] and time.time() - _toss_cache["token_at"] < TOKEN_TTL_SEC:
+        return _toss_cache["token"]
+    res = toss_request("POST", "/oauth2/token", form={
+        "grant_type": "client_credentials",
+        "client_id": TOSS_CLIENT_ID,
+        "client_secret": TOSS_CLIENT_SECRET,
+    })
+    _toss_cache.update(token=res["access_token"], token_at=time.time())
+    return _toss_cache["token"]
+
+
+def toss_account_seq(token: str):
+    if _toss_cache["account_seq"] is None:
+        _toss_cache["account_seq"] = toss_request("GET", "/api/v1/accounts", token)["result"][0]["accountSeq"]
+    return _toss_cache["account_seq"]
+
+
+def toss_call(method: str, path: str, account: bool = True, account_seq=None) -> dict:
+    """인증 헤더를 붙여 호출. 토큰이 거부(401)되면 새 토큰으로 한 번 더 시도."""
+    for attempt in range(2):
+        token = toss_token(force=attempt > 0)
+        seq = None
+        if account:
+            seq = account_seq if account_seq is not None else toss_account_seq(token)
+        try:
+            return toss_request(method, path, token, seq)
+        except TossError as e:
+            if e.status == 401 and attempt == 0:
+                continue
+            raise
+
+
+def toss_buying_power_usd() -> float:
+    res = toss_call("GET", "/api/v1/buying-power?currency=USD")
+    return float(res["result"]["cashBuyingPower"])
+
+
+def toss_cancel_order(order_id: str, account_seq=None) -> None:
+    toss_call("DELETE", f"/api/v1/orders/{order_id}", account_seq=account_seq)
+
+
+def toss_holding_quantity(symbol: str, account_seq=None) -> float:
+    res = toss_call("GET", f"/api/v1/holdings?symbol={urllib.parse.quote(symbol)}", account_seq=account_seq)
+    for item in (res.get("result") or {}).get("items") or []:
+        if item.get("symbol") == symbol:
+            return float(item.get("quantity") or 0)
+    return 0.0
+
+
 # ════════════════════════════════════════════════════════════
 # 버튼 처리
 # ════════════════════════════════════════════════════════════
@@ -160,13 +274,34 @@ def release_waiting(chat_id: int, message_id: int) -> bool:
 def handle_buy(chat_id: int, message: dict, symbol: str) -> str:
     message_id = message["message_id"]
     base = base_text(message)
-    awaiting_amount.setdefault(chat_id, {})[message_id] = {"symbol": symbol, "base": base}
-    edit_message(
-        chat_id, message_id,
-        base + SEP + "💰 매수 금액을 채팅창에 입력해주세요\n"
-                     "(예: 90  또는  $90.50 / 여러 종목이면 'TEAM 100, NVDA 200')",
-        buttons=[[{"text": "❌ 취소", "callback_data": f"cancel_buy:{symbol}"}]],
-    )
+
+    # 토스 달러 예수금 조회 — 실패하면 원래 버튼으로 되돌림
+    try:
+        buying_power = toss_buying_power_usd()
+    except Exception as e:
+        print(f"[토스] 예수금 조회 실패 ({symbol}): {type(e).__name__}: {e}")
+        release_waiting(chat_id, message_id)
+        edit_message(chat_id, message_id,
+                     base + SEP + "⚠️ 예수금 조회 실패, 잠시 후 다시 시도해주세요",
+                     buttons=decision_buttons(symbol))
+        return "예수금 조회 실패"
+
+    lines = [f"💰 달러 예수금: ${buying_power:,.2f}"]
+    try:
+        committed = committed_budget(load_positions(), exclude=symbol)
+        if committed > 0:
+            lines.append(f"(이미 승인된 금액 ${committed:,.2f} 제외 → 사용 가능 "
+                         f"${max(buying_power - committed, 0):,.2f})")
+    except Exception as e:                          # 안내용 정보라 실패해도 진행 (금액 입력 시 다시 확인)
+        print(f"[SSM] 승인 금액 합계 조회 실패: {e}")
+    lines += ["매수 금액을 채팅창에 입력해주세요",
+              "(예: 90  또는  $90.50 / 여러 종목이면 'TEAM 100, NVDA 200')"]
+
+    awaiting_amount.setdefault(chat_id, {})[message_id] = {
+        "symbol": symbol, "base": base, "buying_power": buying_power,
+    }
+    edit_message(chat_id, message_id, base + SEP + "\n".join(lines),
+                 buttons=[[{"text": "❌ 취소", "callback_data": f"cancel_buy:{symbol}"}]])
     return "금액을 입력해주세요"
 
 
@@ -182,14 +317,56 @@ def handle_cancel_buy(chat_id: int, message: dict, symbol: str) -> str:
         note = "금액 입력을 취소했어요"            # 아직 저장 전 → SSM은 건드리지 않음
     else:
         positions = load_positions()
-        if symbol in positions:
+        pos = positions.get(symbol)
+        if pos and pos.get("status") == "PENDING":
+            # 이미 매수 주문이 들어간 종목 → 토스 주문 취소가 확실할 때만 SSM에서 삭제
+            ok, note = cancel_pending_order(chat_id, symbol, pos)
+            if not ok:
+                return note                         # 메시지는 그대로 두고 안내만
+        else:
+            note = "승인을 취소했어요" if pos else "취소했어요"
+        if pos:
             positions.pop(symbol)
             save_positions(positions)
-            note = "승인을 취소했어요"
-        else:
-            note = "취소했어요"
     edit_message(chat_id, message_id, base_text(message), buttons=decision_buttons(symbol))
     return note
+
+
+def cancel_pending_order(chat_id: int, symbol: str, pos: dict) -> tuple[bool, str]:
+    """PENDING 포지션의 토스 주문 취소. (SSM에서 지워도 되는지, 안내 문구) 반환."""
+    order_id = pos.get("order_id")
+    account_seq = pos.get("account_seq")
+    if not order_id:
+        send_message(chat_id, f"⚠️ {symbol}: 주문 번호가 저장돼 있지 않아 자동 취소할 수 없어요.\n"
+                              f"토스 앱에서 직접 확인·취소해주세요.")
+        return False, "주문 번호 없음"
+    try:
+        toss_cancel_order(order_id, account_seq)
+        print(f"[토스] {symbol} 주문 {order_id} 취소")
+        send_message(chat_id, f"↩ {symbol} 매수 주문을 취소했어요.")
+        return True, "주문을 취소했어요"
+    except TossError as e:
+        if "not-found" not in e.code:
+            print(f"[토스] {symbol} 주문 취소 실패: {e}")
+            send_message(chat_id, f"⚠️ {symbol} 주문 취소 실패 ({e}).\n잠시 후 다시 눌러주세요.")
+            return False, "주문 취소 실패"
+    except Exception as e:
+        print(f"[토스] {symbol} 주문 취소 실패: {type(e).__name__}: {e}")
+        send_message(chat_id, f"⚠️ {symbol} 주문 취소 실패 ({type(e).__name__}).\n잠시 후 다시 눌러주세요.")
+        return False, "주문 취소 실패"
+
+    # not-found: 이미 체결·취소·만료된 주문 → 보유 내역으로 체결 여부 확인
+    try:
+        qty = toss_holding_quantity(symbol, account_seq)
+    except Exception as e:
+        send_message(chat_id, f"⚠️ {symbol} 주문을 찾을 수 없는데, 체결 여부 확인도 실패했어요 ({e}).\n"
+                              f"토스 앱에서 확인해주세요.")
+        return False, "확인 실패"
+    if qty > 0:
+        send_message(chat_id, f"⚠️ {symbol}은(는) 이미 체결돼서 취소할 수 없어요 (보유 {qty:g}주).")
+        return False, "이미 체결됨"
+    send_message(chat_id, f"↩ {symbol} 주문은 이미 취소·만료된 상태라 기록만 정리했어요.")
+    return True, "승인을 취소했어요"
 
 
 # ════════════════════════════════════════════════════════════
@@ -246,7 +423,8 @@ def apply_amounts(chat_id: int, items: list[tuple[int, float]]) -> list[str]:
         release_waiting(chat_id, message_id)
         edit_message(
             chat_id, message_id,
-            state["base"] + SEP + f"✅ 승인 완료! 매수 금액: ${amount:,.2f}",
+            state["base"] + SEP + f"✅ 승인 완료! 매수 금액: ${amount:,.2f}\n"
+                                  f"미국 정규장이 열리면 시장가로 매수해요.",
             buttons=[[{"text": "❌ 승인 취소", "callback_data": f"cancel_buy:{symbol}"}]],
         )
         print(f"[승인] {symbol} budget=${amount:,.2f} → SSM {SSM_KEY} 저장")
@@ -259,6 +437,18 @@ def amount_error(amount: float | None) -> str | None:
         return "숫자만 입력해주세요 (예: 90  또는  $90.50)"
     if amount <= 0:
         return "0보다 큰 금액을 입력해주세요"
+    return None
+
+
+def over_budget_error(state: dict, amount: float, positions: dict, batch_used: float = 0.0) -> str | None:
+    """승인 시 조회한 달러 예수금에서, 이미 승인된(APPROVED) 다른 종목 금액과
+    이번 입력에서 앞서 처리한 금액을 뺀 '사용 가능 금액'을 넘으면 오류."""
+    buying_power = state.get("buying_power")
+    if buying_power is None:
+        return None
+    available = buying_power - committed_budget(positions, exclude=state["symbol"]) - batch_used
+    if amount > available + 1e-9:
+        return f"예수금을 초과해요 (사용 가능 ${max(available, 0):,.2f}). 다시 입력해주세요"
     return None
 
 
@@ -284,7 +474,7 @@ def handle_text(chat_id: int, msg: dict) -> None:
                                   f"'TEAM 100, NVDA 200'처럼 종목명과 금액을 함께 입력하거나,\n"
                                   f"그 종목 메시지에 답장(reply)으로 보내주세요.")
             return
-        err = amount_error(single)
+        err = amount_error(single) or over_budget_error(waiting[target], single, load_positions())
         if err:
             send_message(chat_id, f"⚠️ {err}")
             return
@@ -294,7 +484,8 @@ def handle_text(chat_id: int, msg: dict) -> None:
     # ── ② 종목명 + 금액 (한 종목 또는 여러 종목) ──
     pairs, errors = parse_multi(text)
     by_symbol = {s["symbol"]: mid for mid, s in waiting.items()}
-    items, seen = [], set()
+    positions = load_positions()
+    items, seen, batch_used = [], set(), 0.0
     for symbol, amount_text in pairs:
         if symbol not in by_symbol:
             errors.append(f"{symbol}: 금액을 기다리는 종목이 아니에요")
@@ -303,11 +494,12 @@ def handle_text(chat_id: int, msg: dict) -> None:
             errors.append(f"{symbol}: 두 번 입력됐어요 (처음 값만 사용)")
             continue
         amount = parse_amount(amount_text)
-        err = amount_error(amount)
+        err = amount_error(amount) or over_budget_error(waiting[by_symbol[symbol]], amount, positions, batch_used)
         if err:
             errors.append(f"{symbol}: {err}")
             continue
         seen.add(symbol)
+        batch_used += amount
         items.append((by_symbol[symbol], amount))
 
     done = apply_amounts(chat_id, items) if items else []
@@ -367,6 +559,8 @@ def main() -> None:
     if not TELEGRAM_TOKEN or not ALLOWED_CHAT_ID:
         sys.exit("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 환경변수를 설정하세요.")
 
+    if not TOSS_CLIENT_ID or not TOSS_CLIENT_SECRET:
+        print("[경고] TOSS_CLIENT_ID / TOSS_CLIENT_SECRET 없음 → 승인 시 예수금 조회가 실패합니다")
     print(f"봇 시작됨 (허용 Chat ID {ALLOWED_CHAT_ID}, SSM {SSM_KEY} @ {AWS_REGION})")
     offset = None
     while True:
