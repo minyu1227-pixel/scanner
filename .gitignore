@@ -3,3 +3,4 @@ __pycache__/
 scan_*.csv
 .venv/
 .env
+*.pem
