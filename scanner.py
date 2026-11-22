@@ -630,6 +630,8 @@ def main() -> None:
 
     send_telegram(message)
     deliver_signals(signal_msgs)
+    if not ok:
+        sys.exit(1)
 
 
 SIGNALS_PREFIX = "/scanner/signals/"
@@ -663,8 +665,6 @@ def deliver_signals(signal_msgs: list[tuple[str, str]]) -> None:
     for symbol, text in signal_msgs[saved:]:
         time.sleep(0.5)                     # 텔레그램 전송 속도 제한 여유
         send_telegram(text, reply_markup=signal_keyboard(symbol))
-    if not ok:
-        sys.exit(1)
 
 
 if __name__ == "__main__":
