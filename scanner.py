@@ -192,7 +192,15 @@ def _split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     return chunks or [text[:limit]]
 
 
-def send_telegram(text: str) -> bool:
+def signal_keyboard(ticker: str) -> dict:
+    """시그널 메시지 아래에 붙일 인라인 키보드 (✅ 승인 → buy:티커, ⏭ 패스 → pass:티커)."""
+    return {"inline_keyboard": [[
+        {"text": "✅ 승인", "callback_data": f"buy:{ticker}"},
+        {"text": "⏭ 패스", "callback_data": f"pass:{ticker}"},
+    ]]}
+
+
+def send_telegram(text: str, reply_markup: dict | None = None) -> bool:
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
@@ -201,12 +209,16 @@ def send_telegram(text: str) -> bool:
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok = True
-    for chunk in _split_message(text):
-        data = urllib.parse.urlencode({
+    chunks = _split_message(text)
+    for idx, chunk in enumerate(chunks):
+        payload = {
             "chat_id": chat_id,
             "text": chunk,
             "disable_web_page_preview": "true",
-        }).encode("utf-8")
+        }
+        if reply_markup and idx == len(chunks) - 1:   # 버튼은 마지막 조각에만
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        data = urllib.parse.urlencode(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST")
         for attempt in range(3):
             try:
@@ -496,7 +508,7 @@ def run_codes(args, codes: list[str]) -> tuple[str, bool]:
         print(f"\n[{t}] 시그널 {len(sig)}회")
         print(shown.drop(columns="AvgTurnoverUSD").to_string())
 
-    return "\n".join(lines).strip(), any_data
+    return "\n".join(lines).strip(), any_data, []
 
 
 def run_scan(args) -> tuple[str, bool]:
@@ -532,7 +544,7 @@ def run_scan(args) -> tuple[str, bool]:
     print()
 
     if not rows:
-        return (f"⚠️ 스캔 실패: 시세 데이터를 받지 못했습니다. (대상 {len(tickers):,}종목)", False)
+        return (f"⚠️ 스캔 실패: 시세 데이터를 받지 못했습니다. (대상 {len(tickers):,}종목)", False, [])
 
     res = pd.DataFrame(rows)
     # 거래정지·상폐 등으로 최신 봉이 없는 종목 제외 → 가장 최근 거래일 기준
@@ -569,7 +581,20 @@ def run_scan(args) -> tuple[str, bool]:
         body = [f"{i}. {r.Ticker}" + (f" ({r.Name})" if r.Name else "")
                 + f" | {r.Date} | ${r.Close:,.2f}"
                 for i, r in enumerate(hits.itertuples(index=False), 1)]
-    return "\n".join(header + body), True
+        body += ["", "👇 종목별 메시지에서 승인/패스를 선택하세요."]
+
+    # 종목별 시그널 메시지 + 승인/패스 버튼
+    signal_msgs = []
+    for r in hits.itertuples(index=False):
+        text = "\n".join([
+            f"📈 시그널: {r.Ticker}" + (f" ({r.Name})" if r.Name else ""),
+            f"날짜: {r.Date}",
+            f"종가: ${r.Close:,.2f}",
+            f"이격도: {r.Disparity:.2f} (직전 10봉 최저 {r.MinDisp10:.2f})",
+            f"20일 평균 거래대금: 약 {r.AvgTurnoverKRW_억:,.0f}억 원",
+        ])
+        signal_msgs.append((text, signal_keyboard(r.Ticker)))
+    return "\n".join(header + body), True, signal_msgs
 
 
 # ════════════════════════════════════════════════════════════
@@ -597,13 +622,16 @@ def main() -> None:
 
     codes = parse_codes(args.codes)
     try:
-        message, ok = run_codes(args, codes) if codes else run_scan(args)
+        message, ok, signal_msgs = run_codes(args, codes) if codes else run_scan(args)
     except Exception as e:
         mode = f"종목 조회({', '.join(codes)})" if codes else "전체 스캔"
         send_telegram(f"❌ 스캐너 실행 오류 - {mode}\n{type(e).__name__}: {e}")
         raise
 
     send_telegram(message)
+    for text, keyboard in signal_msgs:
+        time.sleep(0.5)                     # 텔레그램 전송 속도 제한 여유
+        send_telegram(text, reply_markup=keyboard)
     if not ok:
         sys.exit(1)
 
