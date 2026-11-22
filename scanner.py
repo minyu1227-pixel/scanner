@@ -593,7 +593,7 @@ def run_scan(args) -> tuple[str, bool]:
             f"이격도: {r.Disparity:.2f} (직전 10봉 최저 {r.MinDisp10:.2f})",
             f"20일 평균 거래대금: 약 {r.AvgTurnoverKRW_억:,.0f}억 원",
         ])
-        signal_msgs.append((text, signal_keyboard(r.Ticker)))
+        signal_msgs.append((r.Ticker, text))
     return "\n".join(header + body), True, signal_msgs
 
 
@@ -629,9 +629,40 @@ def main() -> None:
         raise
 
     send_telegram(message)
-    for text, keyboard in signal_msgs:
+    deliver_signals(signal_msgs)
+
+
+SIGNALS_PREFIX = "/scanner/signals/"
+
+
+def deliver_signals(signal_msgs: list[tuple[str, str]]) -> None:
+    """종목별 시그널 메시지 전달.
+    SIGNAL_DELIVERY=ssm (GitHub Actions) → SSM /scanner/signals/ 에 저장 → EC2의 bot.py가
+      토스 달러 예수금을 붙여 버튼 메시지로 전송 (토스는 EC2 고정 IP에서만 호출 가능)
+    그 외(로컬 실행) 또는 SSM 저장 실패 → 지금처럼 텔레그램으로 직접 전송"""
+    if not signal_msgs:
+        return
+    saved = 0
+    if os.environ.get("SIGNAL_DELIVERY", "").lower() == "ssm":
+        try:
+            import boto3
+            ssm = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "ap-northeast-2"))
+            batch = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            for i, (symbol, text) in enumerate(signal_msgs, 1):
+                ssm.put_parameter(
+                    Name=f"{SIGNALS_PREFIX}{batch}-{i:03d}-{symbol}",
+                    Value=json.dumps({"symbol": symbol, "text": text, "created_at": batch}, ensure_ascii=False),
+                    Type="String",
+                    Overwrite=True,
+                )
+                saved += 1
+            print(f"[SSM] 시그널 {saved}개 저장 → EC2 bot.py가 예수금을 붙여 전송")
+            return
+        except Exception as e:
+            print(f"[SSM] 시그널 저장 실패({saved}개 저장됨) → 나머지는 텔레그램 직접 전송: {type(e).__name__}: {e}")
+    for symbol, text in signal_msgs[saved:]:
         time.sleep(0.5)                     # 텔레그램 전송 속도 제한 여유
-        send_telegram(text, reply_markup=keyboard)
+        send_telegram(text, reply_markup=signal_keyboard(symbol))
     if not ok:
         sys.exit(1)
 

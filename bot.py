@@ -31,6 +31,7 @@ scanner.py가 보낸 시그널 메시지의 버튼을 처리합니다. 여러 �
 
 from __future__ import annotations
 
+import gzip
 import json
 import math
 import os
@@ -47,6 +48,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 SSM_KEY = "/scanner/positions"
+HELD_STATUSES = ("OPEN", "BREAKEVEN")   # 체결 후 monitor.py가 손절·익절 조건주문을 관리하는 상태
 
 # 토스증권 OpenAPI (toss_api_docs.md 규격) — 키는 서버 환경변수 파일(.env)에서 읽음
 TOSS_CLIENT_ID = os.environ.get("TOSS_CLIENT_ID", "").strip()
@@ -178,6 +180,17 @@ def toss_request(method: str, path: str, token: str | None = None, account_seq=N
             raise
 
 
+def read_body(resp) -> str:
+    """응답 본문 읽기. 토스는 오류 응답을 gzip으로 압축해서 보내므로 풀어서 읽음."""
+    raw = resp.read()
+    if resp.headers.get("Content-Encoding", "").lower() == "gzip" or raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    return raw.decode("utf-8", errors="replace")
+
+
 def _toss_request_once(method: str, path: str, token: str | None, account_seq, form: dict | None) -> dict:
     headers = {}
     data = None
@@ -191,10 +204,10 @@ def _toss_request_once(method: str, path: str, token: str | None, account_seq, f
     req = urllib.request.Request(TOSS_BASE + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            body = r.read().decode("utf-8")
+            body = read_body(r)
             return json.loads(body) if body.strip() else {}
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace")
+        raw = read_body(e)
         try:
             err = json.loads(raw).get("error", {})
         except Exception:
@@ -318,6 +331,11 @@ def handle_cancel_buy(chat_id: int, message: dict, symbol: str) -> str:
     else:
         positions = load_positions()
         pos = positions.get(symbol)
+        if pos and pos.get("status") in HELD_STATUSES:
+            # 이미 체결돼 손절·익절 조건주문이 걸린 종목 → 기록을 지우면 조건주문 관리가 끊기므로 거절
+            send_message(chat_id, f"⚠️ {symbol}은(는) 이미 매수가 체결돼 손절·익절 감시 중이라 취소할 수 없어요.\n"
+                                  f"팔고 싶으면 토스 앱에서 직접 매도해주세요 (매도되면 자동으로 정리돼요).")
+            return "이미 체결된 종목"
         if pos and pos.get("status") == "PENDING":
             # 이미 매수 주문이 들어간 종목 → 토스 주문 취소가 확실할 때만 SSM에서 삭제
             ok, note = cancel_pending_order(chat_id, symbol, pos)
@@ -411,15 +429,25 @@ def apply_amounts(chat_id: int, items: list[tuple[int, float]]) -> list[str]:
     waiting = awaiting_amount[chat_id]
     positions = load_positions()          # 실패하면 예외 → 아무것도 저장/해제하지 않음
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    done, skipped = [], set()
     for message_id, amount in items:
         symbol = waiting[message_id]["symbol"]
+        if (positions.get(symbol) or {}).get("status") in ("PENDING",) + HELD_STATUSES:
+            skipped.add(message_id)       # 이미 주문·보유 중인 종목은 덮어쓰지 않음
+            continue
         positions[symbol] = {"symbol": symbol, "status": "APPROVED", "budget": amount, "approved_at": now}
-    save_positions(positions)             # 여러 종목도 SSM 쓰기는 1번
+    if len(skipped) < len(items):
+        save_positions(positions)         # 여러 종목도 SSM 쓰기는 1번
 
-    done = []
     for message_id, amount in items:
         state = waiting[message_id]
         symbol = state["symbol"]
+        if message_id in skipped:
+            release_waiting(chat_id, message_id)
+            edit_message(chat_id, message_id,
+                         state["base"] + SEP + "⚠️ 이미 매수 주문·보유 중인 종목이라 새로 승인하지 않았어요.")
+            done.append(f"⚠️ {symbol} 이미 보유/주문 중 → 건너뜀")
+            continue
         release_waiting(chat_id, message_id)
         edit_message(
             chat_id, message_id,
@@ -513,6 +541,67 @@ def handle_text(chat_id: int, msg: dict) -> None:
 
 
 # ════════════════════════════════════════════════════════════
+# 시그널 전달 (GitHub Actions → SSM /scanner/signals/ → 여기서 예수금 붙여 전송)
+# ════════════════════════════════════════════════════════════
+SIGNALS_PATH = "/scanner/signals"
+SIGNAL_CHECK_SEC = 20
+_last_signal_check = 0.0
+
+
+def fetch_signal_params() -> list[dict]:
+    params, token = [], None
+    while True:
+        kwargs = {"Path": SIGNALS_PATH, "Recursive": True, "MaxResults": 10}
+        if token:
+            kwargs["NextToken"] = token
+        res = ssm.get_parameters_by_path(**kwargs)
+        params += res.get("Parameters", [])
+        token = res.get("NextToken")
+        if not token:
+            return sorted(params, key=lambda p: p["Name"])   # 이름 = 배치시각-순번-종목 → 스캔 순서대로
+
+
+def deliver_pending_signals(force: bool = False) -> None:
+    global _last_signal_check
+    if not force and time.time() - _last_signal_check < SIGNAL_CHECK_SEC:
+        return
+    _last_signal_check = time.time()
+    try:
+        params = fetch_signal_params()
+    except Exception as e:
+        print(f"[시그널] SSM 조회 실패: {type(e).__name__}: {e}")
+        return
+    if not params:
+        return
+
+    try:
+        bp_line = f"💰 달러 예수금: ${toss_buying_power_usd():,.2f}"
+    except Exception as e:
+        print(f"[토스] 시그널용 예수금 조회 실패: {type(e).__name__}: {e}")
+        bp_line = "💰 달러 예수금: 조회 실패 (승인 시 다시 조회해요)"
+
+    for p in params:
+        try:
+            sig = json.loads(p["Value"])
+            symbol, text = sig["symbol"], sig["text"]
+        except Exception:
+            print(f"[시그널] 형식 오류로 삭제: {p['Name']}")
+            ssm.delete_parameter(Name=p["Name"])
+            continue
+        res = tg_call("sendMessage", {
+            "chat_id": int(ALLOWED_CHAT_ID),
+            "text": text + SEP + bp_line,
+            "reply_markup": {"inline_keyboard": decision_buttons(symbol)},
+        })
+        if not (res and res.get("ok")):
+            print(f"[시그널] {symbol} 전송 실패 → 다음 확인 때 다시 시도")
+            break                                   # SSM에 남겨두고 순서 유지
+        ssm.delete_parameter(Name=p["Name"])
+        print(f"[시그널] {symbol} 전송 (예수금 포함)")
+        time.sleep(0.5)
+
+
+# ════════════════════════════════════════════════════════════
 # 메인 루프
 # ════════════════════════════════════════════════════════════
 HANDLERS = {"buy": handle_buy, "pass": handle_pass, "cancel_buy": handle_cancel_buy}
@@ -565,6 +654,7 @@ def main() -> None:
     offset = None
     while True:
         try:
+            deliver_pending_signals()
             for update in get_updates(offset):
                 offset = update["update_id"] + 1   # 처리 실패해도 같은 업데이트를 무한 반복하지 않게 먼저 증가
                 try:
