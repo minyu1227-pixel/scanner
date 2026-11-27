@@ -3,7 +3,8 @@ monitor.py
 ──────────────────────────────────────────────────────────────
 SSM /scanner/positions 의 종목을 하나씩 확인해서 매수·체결을 처리합니다. (EC2 크론, 1분마다)
 
-  APPROVED : 미국 정규장(뉴욕 09:30~16:00, 서머타임 자동)이 아니면 '매수 대기 중' 출력 후 넘어감
+  APPROVED : 미국 정규장(뉴욕 09:30~16:00, 서머타임 자동, NYSE 휴장일 제외, 조기 마감일 13:00)이
+             아니면 '매수 대기 중' 출력 후 넘어감
              장중이면 달러 예수금·현재가 조회 → min(승인 금액, 예수금) ÷ 현재가 = 정수 수량
                · 1주도 못 사면 '매수 불가' 알림 + SSM에서 삭제
                · 살 수 있으면 시장가 매수 → PENDING(+order_id, account_seq) 저장 → '주문 접수' 알림
@@ -42,7 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -93,14 +94,112 @@ def minutes_since(iso: str | None) -> float:
 # ════════════════════════════════════════════════════════════
 # 장 시간
 # ════════════════════════════════════════════════════════════
-def is_market_open(now: datetime | None = None) -> bool:
-    """미국 정규장: 뉴욕 시간 평일 09:30~16:00 (서머타임은 America/New_York 시간대가 자동 적용).
-    미국 공휴일·조기 폐장은 반영하지 않음 → 그날 주문이 거절되면 APPROVED로 남겨두고 다음 장에 재시도."""
+# 규칙으로 계산할 수 없는 임시 휴장(전직 대통령 국장 등)이 발표되면 여기에 추가 — 예: date(2025, 1, 9)
+EXTRA_CLOSED_DAYS: set[date] = set()
+# 규칙 밖의 임시 조기 마감(뉴욕 13:00)이 발표되면 여기에 추가
+EXTRA_EARLY_CLOSE_DAYS: set[date] = set()
+
+MARKET_OPEN_MIN = 9 * 60 + 30   # 09:30
+REGULAR_CLOSE_MIN = 16 * 60     # 16:00
+EARLY_CLOSE_MIN = 13 * 60       # 13:00 (조기 마감일)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """그 달의 n번째 weekday(월=0). n=-1 이면 마지막 weekday."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    last = (date(year, month + 1, 1) if month < 12 else date(year + 1, 1, 1)) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _easter(year: int) -> date:
+    """부활절 (그레고리력, Anonymous Gregorian algorithm)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = (h + l - 7 * m + 114) % 31 + 1
+    return date(year, month, day)
+
+
+def _observed(d: date) -> date:
+    """토요일 공휴일 → 금요일, 일요일 공휴일 → 월요일에 휴장 (NYSE 규칙)."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def nyse_holidays(year: int) -> set[date]:
+    """뉴욕증권거래소 정규 휴장일."""
+    days = {
+        _nth_weekday(year, 1, 0, 3),          # 마틴 루터 킹 데이: 1월 셋째 월요일
+        _nth_weekday(year, 2, 0, 3),          # 대통령의 날: 2월 셋째 월요일
+        _easter(year) - timedelta(days=2),    # 성금요일
+        _nth_weekday(year, 5, 0, -1),         # 메모리얼 데이: 5월 마지막 월요일
+        _observed(date(year, 7, 4)),          # 독립기념일
+        _nth_weekday(year, 9, 0, 1),          # 노동절: 9월 첫째 월요일
+        _nth_weekday(year, 11, 3, 4),         # 추수감사절: 11월 넷째 목요일
+        _observed(date(year, 12, 25)),        # 크리스마스
+    }
+    # 새해 첫날: 일요일이면 월요일 휴장, 토요일이면 전년 12/31을 쉬지 않음 (NYSE 규칙)
+    new_year = date(year, 1, 1)
+    if new_year.weekday() == 6:
+        days.add(new_year + timedelta(days=1))
+    elif new_year.weekday() < 5:
+        days.add(new_year)
+    if year >= 2022:
+        days.add(_observed(date(year, 6, 19)))  # 준틴스 (2022년부터)
+    return days
+
+
+def nyse_early_closes(year: int) -> set[date]:
+    """뉴욕 13:00 조기 마감일: 독립기념일 전날(7/3), 추수감사절 다음 날, 크리스마스 이브(12/24).
+    단 그날이 주말이거나 휴장일이면 조기 마감 없음."""
+    holidays = nyse_holidays(year)
+    candidates = {
+        date(year, 7, 3),
+        _nth_weekday(year, 11, 3, 4) + timedelta(days=1),
+        date(year, 12, 24),
+    }
+    return {d for d in candidates if d.weekday() < 5 and d not in holidays}
+
+
+def market_close_minute(d: date) -> int | None:
+    """그날 정규장 마감 시각(뉴욕, 자정부터 분). 휴장일이면 None."""
+    if d.weekday() >= 5 or d in EXTRA_CLOSED_DAYS or d in nyse_holidays(d.year):
+        return None
+    if d in EXTRA_EARLY_CLOSE_DAYS or d in nyse_early_closes(d.year):
+        return EARLY_CLOSE_MIN
+    return REGULAR_CLOSE_MIN
+
+
+def market_status(now: datetime | None = None) -> str:
+    """'장중' 이 아니면 그 이유(로그용)."""
     now = (now or datetime.now(timezone.utc)).astimezone(NY)
-    if now.weekday() >= 5:
-        return False
+    close = market_close_minute(now.date())
+    if close is None:
+        return "주말" if now.weekday() >= 5 else "미국 휴장일"
     minutes = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= minutes < 16 * 60
+    if minutes < MARKET_OPEN_MIN:
+        return "개장 전"
+    if minutes >= close:
+        return "조기 마감 후" if close == EARLY_CLOSE_MIN else "장 마감 후"
+    return "장중"
+
+
+def is_market_open(now: datetime | None = None) -> bool:
+    """미국 정규장: 뉴욕 시간 09:30~16:00 (서머타임은 America/New_York 시간대가 자동 적용).
+    NYSE 휴장일엔 열리지 않고, 조기 마감일엔 13:00에 닫힘.
+    임시 휴장은 EXTRA_CLOSED_DAYS에 추가 — 빠뜨려도 주문이 거절되면 APPROVED로 남겨두고 다음 장에 재시도."""
+    return market_status(now) == "장중"
 
 
 # ════════════════════════════════════════════════════════════
@@ -305,7 +404,7 @@ class Toss:
 # ════════════════════════════════════════════════════════════
 def handle_approved(toss_getter, symbol: str, pos: dict, assume_open: bool) -> None:
     if not (assume_open or is_market_open()):
-        log(f"{symbol}: 매수 대기 중 (미국 정규장 아님, 뉴욕 {datetime.now(NY):%m-%d %H:%M})")
+        log(f"{symbol}: 매수 대기 중 ({market_status()}, 뉴욕 {datetime.now(NY):%m-%d %H:%M})")
         return
 
     toss = toss_getter()
