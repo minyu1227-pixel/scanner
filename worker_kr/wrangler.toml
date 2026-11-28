@@ -1,0 +1,11 @@
+name = "scanner-kr-worker"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+# 국내주식 스캐너 워커 — 미국용 루트 wrangler.toml(scanner-worker)과 별개
+# cron은 UTC 기준 (한국시간 = UTC + 9시간). worker.js의 PRIMARY_CRON / BACKUP_CRON 과 같아야 합니다.
+[triggers]
+crons = [
+  "30 7 * * 1-5",  # 평일 한국시간 16:30 — 1차
+  "30 8 * * 1-5",  # 평일 한국시간 17:30 — 2차(백업)
+]
