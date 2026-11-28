@@ -10,7 +10,9 @@ MACD(5, 20, 5) 골든크로스 + 이격도(15 SMA) 과매도 이력 스캐너 �
 2차 조건  : 최근 20거래일 평균 거래대금(종가 × 거래량) >= 300억 원
 시그널    : ① 최근 봉에서 MACD 골든크로스
             ② 최근 봉을 제외한 직전 10개 봉 중 이격도 <= 85 인 봉 존재
-휴장일    : 최근 봉 날짜가 오늘(한국시간)이 아니면 휴장일로 보고 시그널을 보내지 않음
+휴장일    : 최근 봉 날짜가 오늘(한국시간)이 아니면 시그널을 보내지 않음
+            · 주말·KRX 휴장일(krx_calendar.py)이면 '휴장일' 안내 (성공)
+            · 거래일인데 오늘 봉이 없으면 '시세 지연' 안내 + 실패 종료 → 17:30 백업 실행이 다시 시도
 
 텔레그램  : 환경변수 TELEGRAM_TOKEN_KR(국장 전용 봇), TELEGRAM_CHAT_ID
             (미국용 TELEGRAM_TOKEN은 쓰지 않습니다)
@@ -41,6 +43,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+from krx_calendar import is_trading_day
 
 # ───── 전제 조건 (scanner.py와 동일) ─────
 MACD_FAST = 5
@@ -400,10 +404,15 @@ def run_scan(args) -> tuple[str, bool, list]:
 
     today = kst_now().date()
     if scan_date != today and not args.allow_stale:
-        msg = (f"📭 [국장] 오늘({today})은 휴장일이에요 — 최근 거래일이 {scan_date}라 스캔 결과를 보내지 않아요.\n"
-               f"(장중 실행이거나 시세 지연이면 --allow-stale 로 다시 실행)")
+        if not is_trading_day(today):
+            msg = f"📭 [국장] 오늘({today})은 휴장일이에요 — 스캔 결과를 보내지 않아요."
+            print(msg)
+            return msg, True, []
+        # 거래일인데 오늘 봉이 없음 → 시세 지연. 실패로 끝내서 17:30 백업 실행이 다시 시도하게 함
+        msg = (f"⚠️ [국장] 오늘({today}) 시세가 아직 반영되지 않았어요 (최근 데이터 {scan_date}).\n"
+               f"17:30 백업 실행 때 다시 시도해요. 그때도 이 메시지가 오면 Actions에서 수동 실행해주세요.")
         print(msg)
-        return msg, True, []
+        return msg, False, []
 
     res["AvgTurnover_억"] = (res["AvgTurnoverKRW"] / 1e8).round(0)
     passed = res[res["Pass1_Price"] & res["Pass2_Turnover"]]
